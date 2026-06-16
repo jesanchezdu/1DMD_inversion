@@ -27,7 +27,8 @@ import cmath
 import optuna
 from joblib import Parallel, delayed
 import multiprocessing
-
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # Set seeds for reproducibility
 SEED = 99
 def set_seeds(seed):
@@ -640,8 +641,12 @@ def train_model(synthetic_data, model_type='lstm', epochs=100, batch_size=32, le
     train_dataset = MTAugmentedDataset(torch.FloatTensor(X_train_scaled), torch.FloatTensor(y_train_scaled), augment=True, noise_std=0.05)
     val_dataset = MTAugmentedDataset(torch.FloatTensor(X_val_scaled), torch.FloatTensor(y_val_scaled), augment=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    # Para el Informer en Windows reducimos workers para evitar CUDA timeout
+    nw = 0 #if model_type == 'informer' else NUM_WORKERS
+    pw = False #if model_type == 'informer' else True
+    pf = None #if model_type == 'informer' else 2
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=nw, pin_memory=True, persistent_workers=pw, prefetch_factor=pf)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=nw, pin_memory=True, persistent_workers=pw, prefetch_factor=pf)
     
     model = create_model(model_type, X_train_scaled.shape[1], y_train_scaled.shape[1], hidden_size1, hidden_size2, dropout).to(device)
     visualize_model_architecture(model, model_type, X_train_scaled.shape[1], device)
@@ -921,8 +926,22 @@ def fine_tune_on_real_data(model_type='lstm', epochs=50, lr=1e-4, lambda_smooth=
         input_vec = np.hstack((np.log10(rho_in), phase_in))
         
         true_depths, _, true_res = read_layered_model(layered_file)
-        f_true = interp1d(np.log10(true_depths), np.log10(true_res), fill_value="extrapolate")
+        
+        #######################################################################################################################
+        # Evitar log10(0): reemplazar profundidad 0 por la mitad de la primera capa
+        true_depths_safe = true_depths.copy()
+        true_depths_safe[true_depths_safe <= 0] = true_depths_safe[true_depths_safe > 0][0] / 2.0
+        true_res_safe = true_res.copy()
+        true_res_safe[true_res_safe <= 0] = 1e-3
+        
+        f_true = interp1d(np.log10(true_depths_safe), np.log10(true_res_safe), fill_value="extrapolate", bounds_error=False)
         y_log = f_true(np.log10(layer_depths))
+        # Verificar que no haya NaN o inf
+        y_log = np.nan_to_num(y_log, nan=np.log10(10.0), posinf=4.0, neginf=0.0)
+        #######################################################################################################################
+        
+        #f_true = interp1d(np.log10(true_depths), np.log10(true_res), fill_value="extrapolate")
+        #y_log = f_true(np.log10(layer_depths))
         X_list.append(input_vec); Y_list.append(y_log)
         
     if len(X_list) == 0: return
@@ -1089,7 +1108,13 @@ if __name__ == "__main__":
             
             if args.kfold: run_kfold_cross_validation(synth, model_type, 5, args.epochs, bs, lr)
             print(f"Training Final {model_type.upper()} Model...")
-            train_model(synth, model_type, epochs=args.epochs, batch_size=bs, learning_rate=lr, seed=SEED, hidden_size1=h1, hidden_size2=h2, dropout=do)
+            #train_model(synth, model_type, epochs=args.epochs, batch_size=bs, learning_rate=lr, seed=SEED, hidden_size1=h1, hidden_size2=h2, dropout=do)
+            
+            ##################################################################################################
+            # Informer necesita batch size reducido para evitar CUDA timeout
+            bs_actual = 256 if model_type == 'informer' else bs
+            train_model(synth, model_type, epochs=args.epochs, batch_size=bs_actual, learning_rate=lr, seed=SEED, hidden_size1=h1, hidden_size2=h2, dropout=do)
+            ##################################################################################################
             if os.path.exists('real_data'):
                 print("Fine-tuning on real data...")
                 fine_tune_on_real_data(model_type, epochs=50, lr=1e-4)
